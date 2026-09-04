@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -22,7 +22,9 @@ import {
   pollForExit,
   closeSurface,
   getMuxBackend,
+  isClaudeAvailable,
   sendEscape,
+  type MuxBackend,
   shellEscape,
   renameCurrentTab,
   renameWorkspace,
@@ -53,6 +55,17 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import {
+  requireAgentDefinition,
+  resolveAgentCli,
+  shouldExposeAgentDefinition,
+  shouldRegisterParentSubagentTools,
+} from "./availability.ts";
+import { buildClaudeLaunchArgs } from "./claude-command.ts";
+import {
+  formatInheritedAgentConfigEnv,
+  resolveSubagentPaths,
+} from "./paths.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -75,13 +88,27 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
   }
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+  replaceModuleAbortController();
+}
+
+function readModuleAbortController(): AbortController | undefined {
+  const controller: unknown = Reflect.get(globalThis, POLL_ABORT_KEY);
+  if (controller instanceof AbortController) return controller;
+  return undefined;
+}
+
+function replaceModuleAbortController(): AbortController {
+  const previous = readModuleAbortController();
+  if (previous && !previous.signal.aborted) previous.abort();
+  const replacement = new AbortController();
+  Reflect.set(globalThis, POLL_ABORT_KEY, replacement);
+  return replacement;
 }
 
 function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+  const controller = readModuleAbortController();
+  if (!controller || controller.signal.aborted) return replaceModuleAbortController().signal;
+  return controller.signal;
 }
 
 const SubagentParams = Type.Object({
@@ -158,6 +185,13 @@ interface AgentDefinition extends AgentDefaults {
 
 interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
+}
+
+type ProjectTrustContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted">;
+
+interface SubagentRuntimeOptions {
+  muxBackend?: MuxBackend | null;
+  claudeAvailable?: boolean;
 }
 
 /** Tools that are gated by `spawning: false` */
@@ -254,45 +288,45 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   };
 }
 
-function discoverAgentDefinitions(): ListedAgentDefinition[] {
-  const agents = new Map<string, ListedAgentDefinition>();
+function reportsProjectTrusted(ctx?: ProjectTrustContext | null): boolean {
+  if (!ctx) return false;
+  try {
+    return ctx.isProjectTrusted() === true;
+  } catch {
+    return false;
+  }
+}
+
+function getAgentDefinitionDirs(
+  ctx?: ProjectTrustContext | null,
+): Array<{ path: string; source: AgentSource }> {
   const dirs: Array<{ path: string; source: AgentSource }> = [
     { path: getBundledAgentsDir(), source: "package" },
     { path: join(getAgentConfigDir(), "agents"), source: "global" },
-    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
   ];
+  if (reportsProjectTrusted(ctx)) {
+    dirs.push({ path: join(ctx.cwd, ".pi", "agents"), source: "project" });
+  }
+  return dirs;
+}
 
-  for (const { path: dir, source } of dirs) {
+function discoverAgentDefinitions(
+  ctx?: ProjectTrustContext | null,
+  claudeAvailable = isClaudeAvailable(),
+): ListedAgentDefinition[] {
+  const agents = new Map<string, ListedAgentDefinition>();
+  for (const { path: dir, source } of getAgentDefinitionDirs(ctx)) {
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
       const parsed = parseAgentDefinition(
         readFileSync(join(dir, file), "utf8"),
         file.replace(/\.md$/, ""),
       );
-      if (!parsed) continue;
+      if (!parsed || !shouldExposeAgentDefinition(parsed, claudeAvailable)) continue;
       agents.set(parsed.name, { ...parsed, source });
     }
   }
-
   return [...agents.values()];
-}
-
-function resolveSubagentPaths(
-  params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
-): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
-  const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
-  const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
-  const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
-  const effectiveCwd = rawCwd
-    ? rawCwd.startsWith("/")
-      ? rawCwd
-      : join(cwdBase, rawCwd)
-    : null;
-  const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
-  const effectiveAgentDir =
-    localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
-  return { effectiveCwd, localAgentDir, effectiveAgentDir };
 }
 
 function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
@@ -331,6 +365,26 @@ function resolveLaunchBehavior(
   };
 }
 
+interface ParentDispatchConfig {
+  model?: string;
+  thinking?: string;
+}
+
+function resolveSubagentDispatchConfig(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+  parent: ParentDispatchConfig,
+) {
+  const configuredModel = params.model ?? agentDefs?.model;
+  const inheritsParentModel = !configuredModel;
+  return {
+    model: configuredModel || parent.model,
+    tools: params.tools ?? agentDefs?.tools,
+    skills: params.skills ?? agentDefs?.skills,
+    thinking: agentDefs?.thinking ?? (inheritsParentModel ? parent.thinking : undefined),
+  };
+}
+
 /**
  * Decide whether a subagent is interactive (user-driven, long-running).
  *
@@ -356,21 +410,30 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  const configDir = getAgentConfigDir();
-  const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
-    join(configDir, "agents", `${agentName}.md`),
-    join(getBundledAgentsDir(), `${agentName}.md`),
-  ];
-
-  for (const p of paths) {
-    if (!existsSync(p)) continue;
-    const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName);
+function findAgentDefaults(
+  agentName: string,
+  ctx?: ProjectTrustContext | null,
+): AgentDefaults | null {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(agentName)) return null;
+  const paths = getAgentDefinitionDirs(ctx)
+    .reverse()
+    .map(({ path }) => join(path, `${agentName}.md`));
+  for (const path of paths) {
+    if (!existsSync(path)) continue;
+    const parsed = parseAgentDefinition(readFileSync(path, "utf8"), agentName);
     if (parsed) return parsed;
   }
-
   return null;
+}
+
+function loadAgentDefaults(
+  agentName: string,
+  ctx?: ProjectTrustContext | null,
+  claudeAvailable = isClaudeAvailable(),
+): AgentDefaults | null {
+  const agentDefaults = findAgentDefaults(agentName, ctx);
+  if (!agentDefaults || !shouldExposeAgentDefinition(agentDefaults, claudeAvailable)) return null;
+  return agentDefaults;
 }
 
 function formatElapsed(seconds: number): string {
@@ -393,12 +456,21 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+function formatMuxUnavailableMessage(): string {
+  const setupHint = muxSetupHint();
+  return `Subagents require a supported terminal multiplexer. ${setupHint}`;
+}
+
+function notifyMuxUnavailable(ctx: Pick<ExtensionContext, "ui">): void {
+  ctx.ui.notify(formatMuxUnavailableMessage(), "warning");
+}
+
 function muxUnavailableResult() {
   return {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require a supported terminal multiplexer. ${muxSetupHint()}`,
+        text: formatMuxUnavailableMessage(),
       },
     ],
     details: { error: "mux not available" },
@@ -898,8 +970,13 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  reportsProjectTrusted,
+  shouldRegisterParentSubagentTools,
+  shouldExposeAgentDefinition,
+  resolveAgentCli,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
+  resolveSubagentDispatchConfig,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
@@ -911,6 +988,8 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  replaceModuleAbortController,
+  getModuleAbortSignal,
   runningSubagents,
   formatElapsed,
 };
@@ -932,17 +1011,30 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  ctx: Pick<
+    ExtensionContext,
+    "cwd" | "isProjectTrusted" | "sessionManager" | "model" | "thinkingLevel"
+  >,
+  options?: { surface?: string; claudeAvailable?: boolean },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
-  const effectiveTools = params.tools ?? agentDefs?.tools;
-  const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const resolvedAgentDefs = params.agent === undefined
+    ? null
+    : findAgentDefaults(params.agent, ctx);
+  const agentDefs = requireAgentDefinition(params.agent, resolvedAgentDefs);
+  const effectiveCli = resolveAgentCli(
+    agentDefs,
+    options?.claudeAvailable ?? isClaudeAvailable(),
+  );
+  const parentDispatch = effectiveCli === "pi"
+    ? {
+        model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+        thinking: ctx.thinkingLevel,
+      }
+    : {};
+  const dispatch = resolveSubagentDispatchConfig(params, agentDefs, parentDispatch);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -950,7 +1042,12 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths({
+    requestedCwd: params.cwd,
+    agentCwd: agentDefs?.cwd,
+    currentCwd: process.cwd(),
+    agentConfigDir: getAgentConfigDir(),
+  });
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1007,35 +1104,21 @@ async function launchSubagent(
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
-  if (agentDefs?.cli === "claude") {
+  if (effectiveCli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
 
     const cmdParts: string[] = [];
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
     cmdParts.push("claude");
-    cmdParts.push("--dangerously-skip-permissions");
-
-    if (existsSync(pluginDir)) {
-      cmdParts.push("--plugin-dir", shellEscape(pluginDir));
-    }
-
-    if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
-    }
-
-    const sp = params.systemPrompt ?? agentDefs.body;
-    if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
-    }
-
-    if (params.resumeSessionId) {
-      cmdParts.push("--resume", shellEscape(params.resumeSessionId));
-    }
-
-    // Always pass the task as the prompt — even for resumed sessions,
-    // the caller's task is the follow-up instruction.
-    cmdParts.push(shellEscape(params.task));
+    const claudeArgs = buildClaudeLaunchArgs({
+      pluginDir: existsSync(pluginDir) ? pluginDir : undefined,
+      model: dispatch.model,
+      systemPrompt: params.systemPrompt ?? agentDefs?.body,
+      resumeSessionId: params.resumeSessionId,
+      task: params.task,
+    });
+    cmdParts.push(...claudeArgs.map(shellEscape));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
     const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -1088,8 +1171,8 @@ async function launchSubagent(
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
-  if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
+  if (dispatch.model) {
+    const model = dispatch.thinking ? `${dispatch.model}:${dispatch.thinking}` : dispatch.model;
     parts.push("--model", shellEscape(model));
   }
 
@@ -1111,21 +1194,18 @@ async function launchSubagent(
     parts.push(flag, shellEscape(syspromptPath));
   }
 
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
+  const toolAllowlist = buildSubagentToolAllowlist(dispatch.tools);
   if (toolAllowlist) {
     parts.push("--tools", shellEscape(toolAllowlist));
   }
 
-  // Build env prefix: denied tools + subagent identity + config dir propagation
+  // Build env prefix: denied tools + subagent identity + inherited global config.
   const envParts: string[] = [];
-
-  // If the target cwd has its own .pi/agent/, use that as the config root.
-  // Otherwise propagate the current/global agent dir.
-  if (localAgentDir && existsSync(localAgentDir)) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`);
-  } else if (process.env.PI_CODING_AGENT_DIR) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
-  }
+  const inheritedAgentConfigEnv = formatInheritedAgentConfigEnv(
+    process.env.PI_CODING_AGENT_DIR,
+    shellEscape,
+  );
+  if (inheritedAgentConfigEnv) envParts.push(inheritedAgentConfigEnv);
 
   if (denySet.size > 0) {
     envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
@@ -1166,7 +1246,7 @@ async function launchSubagent(
   }
 
   for (const promptArg of buildPiPromptArgs({
-    effectiveSkills,
+    effectiveSkills: dispatch.skills,
     taskDelivery: launchBehavior.taskDelivery,
     taskArg,
   })) {
@@ -1174,7 +1254,7 @@ async function launchSubagent(
   }
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
-  // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
+  // Session/config placement stays rooted in the inherited global agent directory.
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
@@ -1357,9 +1437,20 @@ async function watchSubagent(
   }
 }
 
-export default function subagentsExtension(pi: ExtensionAPI) {
+export default function subagentsExtension(
+  pi: ExtensionAPI,
+  runtimeOptions: SubagentRuntimeOptions = {},
+) {
+  const muxBackend = runtimeOptions.muxBackend === undefined
+    ? getMuxBackend()
+    : runtimeOptions.muxBackend;
+  const claudeAvailable = runtimeOptions.claudeAvailable ?? isClaudeAvailable();
+  const parentToolsAvailable = shouldRegisterParentSubagentTools(muxBackend);
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
+    // Pi rebinds the extension after shutdown on reload/new/resume/fork; the
+    // previous session's completion signal must never leak into the new runtime.
+    replaceModuleAbortController();
     latestCtx = ctx;
   });
 
@@ -1375,8 +1466,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
+    readModuleAbortController()?.abort();
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
     }
@@ -1391,7 +1481,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       .filter(Boolean),
   );
 
-  const shouldRegister = (name: string) => !deniedTools.has(name);
+  const shouldRegister = (name: string) => parentToolsAvailable && !deniedTools.has(name);
 
   // ── subagent tool ──
   if (shouldRegister("subagent"))
@@ -1447,7 +1537,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        const running = await launchSubagent(params, ctx, { claudeAvailable });
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1656,16 +1746,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       label: "List Subagents",
       description:
         "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "Scans global ~/.pi/agent/agents/ and trusted project-local .pi/agents/. " +
+        "Trusted project-local agents override global ones with the same name.",
       promptSnippet:
         "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "Scans global ~/.pi/agent/agents/ and trusted project-local .pi/agents/. " +
+        "Trusted project-local agents override global ones with the same name.",
       parameters: Type.Object({}),
 
-      async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+      async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+        const list = discoverAgentDefinitions(ctx, claudeAvailable)
+          .filter((agent) => !agent.disableModelInvocation);
 
         if (list.length === 0) {
           return {
@@ -1966,7 +2057,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {
     description: "Fork session into a subagent for focused work (bugfixes, iteration)",
-    handler: async (args, _ctx) => {
+    handler: async (args, ctx) => {
+      if (!parentToolsAvailable) {
+        notifyMuxUnavailable(ctx);
+        return;
+      }
       const task = args.trim() || "";
       const toolCall = task
         ? `Use subagent to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
@@ -1979,6 +2074,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
     handler: async (args, ctx) => {
+      if (!parentToolsAvailable) {
+        notifyMuxUnavailable(ctx);
+        return;
+      }
       const trimmed = args.trim();
       if (!trimmed) {
         ctx.ui.notify("Usage: /subagent <agent> [task]", "warning");
@@ -1989,10 +2088,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
       const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
-      const defs = loadAgentDefaults(agentName);
+      const defs = findAgentDefaults(agentName, ctx);
       if (!defs) {
         ctx.ui.notify(
-          `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
+          `Agent "${agentName}" not found in ~/.pi/agent/agents/ or trusted .pi/agents/`,
+          "error",
+        );
+        return;
+      }
+      if (!shouldExposeAgentDefinition(defs, claudeAvailable)) {
+        ctx.ui.notify(
+          `Agent "${agentName}" requires the claude executable on PATH.`,
           "error",
         );
         return;

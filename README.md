@@ -26,13 +26,13 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 ## Install
 
 ```bash
-pi install git:github.com/HazAT/pi-interactive-subagents
+pi install git:github.com/re-miranda/pi-interactive-subagents
 ```
 
 Supported multiplexers:
 
 - [cmux](https://github.com/manaflow-ai/cmux)
-- [tmux](https://github.com/tmux/tmux)
+- [tmux](https://github.com/tmux/tmux) — capped at five panes per window; additional subagents open in another window
 - [zellij](https://zellij.dev)
 - [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
 
@@ -79,13 +79,13 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Bundled Agents
 
-| Agent             | Model                  | Role                                                                                     |
-| ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Haiku                  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| Agent        | Model                  | Role                                                             |
+| ------------ | ---------------------- | ---------------------------------------------------------------- |
+| **scout**    | Parent session         | Fast codebase reconnaissance — maps files, patterns, conventions |
+| **worker**   | Parent session         | Implements tasks from todos — writes code, runs tests            |
+| **reviewer** | Parent session         | Reviews code for bugs, security issues, correctness              |
+
+Planner, visual-tester, and Claude Code definitions are not bundled. The `/plan` workflow requires a separately configured global or trusted project-local `planner` definition.
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 
@@ -177,6 +177,19 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+
+### Claude Code children
+
+Agent definitions default to a Pi child. Set `cli: claude` to launch Claude Code instead:
+
+```yaml
+---
+name: claude-code
+cli: claude
+---
+```
+
+Claude Code must be available on `PATH`. Claude children start with `--permission-mode manual`; permission prompts remain interactive in their managed multiplexer pane. The launcher binds every option value to its flag and terminates option parsing before the task, so option-shaped inputs cannot add Claude CLI flags. The extension never bypasses permission checks. Runtime choice comes from `cli`, not from a model name such as `anthropic/claude-*`.
 
 ---
 
@@ -289,6 +302,10 @@ spawning: false
 You are a specialized agent that does X...
 ```
 
+For Pi-backed children, omitting `model` inherits the parent session's active model. If the agent also omits `thinking`, it inherits the parent's current thinking level. Explicit tool-call and agent frontmatter values still take precedence.
+
+Claude Code children do not inherit Pi model identifiers; they use only an explicit tool-call or agent model.
+
 ### Frontmatter Reference
 
 | Field         | Type    | Description                                                                                                                                                                                                                                                                 |
@@ -296,6 +313,7 @@ You are a specialized agent that does X...
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
+| `cli`         | string  | Child process runtime: `pi` (default) or `claude`. Claude Code children require the `claude` executable and use interactive manual permissions.                                                                                                                             |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
@@ -420,7 +438,7 @@ deny-tools: subagent
 
 ## Role Folders
 
-The `cwd` parameter lets sub-agents start in a specific directory with its own configuration:
+The `cwd` parameter lets sub-agents start in a specific directory. Child Pi discovers project resources there through its native trust flow; the directory's `.pi/agent` is never promoted to `PI_CODING_AGENT_DIR`. An explicitly inherited global `PI_CODING_AGENT_DIR` remains the child session/config root.
 
 ```
 project/

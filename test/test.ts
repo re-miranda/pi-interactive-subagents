@@ -4,8 +4,8 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "nod
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
-import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import subagentsExtension, { __test__ as testApi } from "../pi-extension/subagents/index.ts";
 
 import {
   getLeafId,
@@ -78,20 +78,28 @@ function withTempDir(run: (dir: string) => void) {
   }
 }
 
+type MockExtensionEventHandler = (event: unknown, context: unknown) => void;
+
 function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
+  const registeredEventHandlers = new Map<string, MockExtensionEventHandler[]>();
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
+    registeredEventHandlers,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(eventName: string, eventHandler: MockExtensionEventHandler) {
+        const eventHandlers = registeredEventHandlers.get(eventName) ?? [];
+        eventHandlers.push(eventHandler);
+        registeredEventHandlers.set(eventName, eventHandlers);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -112,6 +120,40 @@ function createMockExtensionApi() {
         return [];
       },
     } as any,
+  };
+}
+
+interface ListedTestAgent {
+  name: string;
+  source: "package" | "global" | "project";
+}
+
+interface TestAgentDefaults {
+  model?: string;
+  cwd?: string;
+  cli?: string;
+  systemPromptMode?: "append" | "replace";
+  body?: string;
+}
+
+function assertTestAgentDefaults(
+  actual: TestAgentDefaults | null,
+  expected: Required<TestAgentDefaults>,
+): void {
+  assert.ok(actual, `expected defaults for model ${expected.model}`);
+  assert.equal(actual.model, expected.model);
+  assert.equal(actual.cwd, expected.cwd);
+  assert.equal(actual.cli, expected.cli);
+  assert.equal(actual.systemPromptMode, expected.systemPromptMode);
+  assert.equal(actual.body, expected.body);
+}
+
+function createAgentTrustContext(cwd: string, trusted: boolean) {
+  return {
+    cwd,
+    isProjectTrusted() {
+      return trusted;
+    },
   };
 }
 
@@ -864,10 +906,9 @@ describe("status.ts", () => {
 });
 
 describe("subagent discovery", () => {
-  const testApi = (subagentsModule as any).__test__;
 
   it("loads session-mode from frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
         "lineage-mode-test-agent",
@@ -878,14 +919,17 @@ describe("subagent discovery", () => {
         ].join("\n"),
       );
 
-      const loaded = testApi.loadAgentDefaults("lineage-mode-test-agent");
+      const loaded = testApi.loadAgentDefaults(
+        "lineage-mode-test-agent",
+        createAgentTrustContext(projectDir, true),
+      );
       assert.ok(loaded, "expected agent to load");
       assert.equal(loaded.sessionMode, "lineage-only");
     });
   });
 
   it("loads explicit interactive flag from frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
         "interactive-true-test-agent",
@@ -905,16 +949,17 @@ describe("subagent discovery", () => {
         ].join("\n"),
       );
 
-      const loadedTrue = testApi.loadAgentDefaults("interactive-true-test-agent");
+      const trustContext = createAgentTrustContext(projectDir, true);
+      const loadedTrue = testApi.loadAgentDefaults("interactive-true-test-agent", trustContext);
       assert.equal(loadedTrue?.interactive, true);
 
-      const loadedFalse = testApi.loadAgentDefaults("interactive-false-test-agent");
+      const loadedFalse = testApi.loadAgentDefaults("interactive-false-test-agent", trustContext);
       assert.equal(loadedFalse?.interactive, false);
     });
   });
 
   it("leaves interactive undefined when not set in frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
         "interactive-unset-test-agent",
@@ -924,7 +969,10 @@ describe("subagent discovery", () => {
         ].join("\n"),
       );
 
-      const loaded = testApi.loadAgentDefaults("interactive-unset-test-agent");
+      const loaded = testApi.loadAgentDefaults(
+        "interactive-unset-test-agent",
+        createAgentTrustContext(projectDir, true),
+      );
       assert.equal(loaded?.interactive, undefined);
     });
   });
@@ -987,28 +1035,26 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
-    for (const name of ["scout", "worker", "reviewer"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous)`,
-      );
-    }
+  it("bundles only the selected scout, worker, and reviewer definitions", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      for (const name of ["scout", "worker", "reviewer"]) {
+        writeAgentFile(globalAgentsDir, name, `name: ${name}\nmodel: test/global-${name}`);
+      }
 
-    const planner = testApi.loadAgentDefaults("planner");
-    assert.ok(planner, "expected bundled planner to be discoverable");
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
-      true,
-      "planner should resolve as interactive (no auto-exit)",
-    );
+      const discovered = testApi.discoverAgentDefinitions(undefined, true);
+      for (const name of ["scout", "worker", "reviewer"]) {
+        const listed = discovered.find((agent: ListedTestAgent) => agent.name === name);
+        assert.equal(listed?.source, "global", `expected global ${name} to remain available`);
+      }
+      for (const name of ["planner", "visual-tester", "claude-code"]) {
+        assert.equal(testApi.loadAgentDefaults(name, undefined, true), null);
+        assert.equal(discovered.some((agent: ListedTestAgent) => agent.name === name), false);
+      }
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
         "invalid-mode-test-agent",
@@ -1019,7 +1065,10 @@ describe("subagent discovery", () => {
         ].join("\n"),
       );
 
-      const loaded = testApi.loadAgentDefaults("invalid-mode-test-agent");
+      const loaded = testApi.loadAgentDefaults(
+        "invalid-mode-test-agent",
+        createAgentTrustContext(projectDir, true),
+      );
       assert.ok(loaded, "expected agent to load");
       assert.equal(loaded.sessionMode, undefined);
     });
@@ -1079,6 +1128,54 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("inherits the parent model and thinking when an agent does not configure a model", () => {
+    assert.deepEqual(
+      testApi.resolveSubagentDispatchConfig(
+        { name: "A", task: "T" },
+        { tools: "read,bash", skills: "review" },
+        { model: "openai-codex/gpt-parent", thinking: "high" },
+      ),
+      {
+        model: "openai-codex/gpt-parent",
+        tools: "read,bash",
+        skills: "review",
+        thinking: "high",
+      },
+    );
+  });
+
+  it("keeps agent model and thinking overrides ahead of parent defaults", () => {
+    assert.deepEqual(
+      testApi.resolveSubagentDispatchConfig(
+        { name: "A", task: "T" },
+        { model: "anthropic/agent-model", thinking: "low" },
+        { model: "openai-codex/gpt-parent", thinking: "high" },
+      ),
+      {
+        model: "anthropic/agent-model",
+        tools: undefined,
+        skills: undefined,
+        thinking: "low",
+      },
+    );
+  });
+
+  it("does not pass a parent model to runtimes without parent dispatch defaults", () => {
+    assert.deepEqual(
+      testApi.resolveSubagentDispatchConfig(
+        { name: "A", task: "T" },
+        { tools: "read" },
+        {},
+      ),
+      {
+        model: undefined,
+        tools: "read",
+        skills: undefined,
+        thinking: undefined,
+      },
+    );
+  });
+
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
@@ -1113,7 +1210,7 @@ describe("subagent discovery", () => {
   });
 
   it("lists visible agents from discovery", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
         "visible-discovery-test-agent",
@@ -1125,21 +1222,27 @@ describe("subagent discovery", () => {
       );
 
       const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+      subagentsExtension(api, { muxBackend: "tmux", claudeAvailable: true });
 
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute(
+        "test-list",
+        {},
+        undefined,
+        undefined,
+        createAgentTrustContext(projectDir, true),
+      );
       const agents = result.details?.agents ?? [];
 
-      assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
+      assert.ok(agents.some((agent: ListedTestAgent) => agent.name === "visible-discovery-test-agent"));
       assert.match(result.content[0].text, /visible-discovery-test-agent/);
     });
   });
 
   it("hides disable-model-invocation agents from listings but keeps direct loading", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
         "hidden-discovery-test-agent",
@@ -1153,18 +1256,27 @@ describe("subagent discovery", () => {
       );
 
       const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+      subagentsExtension(api, { muxBackend: "tmux", claudeAvailable: true });
 
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute(
+        "test-list",
+        {},
+        undefined,
+        undefined,
+        createAgentTrustContext(projectDir, true),
+      );
       const agents = result.details?.agents ?? [];
 
-      assert.equal(agents.some((agent: any) => agent.name === "hidden-discovery-test-agent"), false);
+      assert.equal(agents.some((agent: ListedTestAgent) => agent.name === "hidden-discovery-test-agent"), false);
       assert.doesNotMatch(result.content[0].text, /hidden-discovery-test-agent/);
 
-      const loaded = testApi.loadAgentDefaults("hidden-discovery-test-agent");
+      const loaded = testApi.loadAgentDefaults(
+        "hidden-discovery-test-agent",
+        createAgentTrustContext(projectDir, true),
+      );
       assert.ok(loaded, "expected hidden agent to remain directly loadable");
       assert.equal(loaded.model, "anthropic/test-hidden");
       assert.equal(loaded.body, "You are the hidden agent.");
@@ -1172,8 +1284,131 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("fails closed without trust and allows trusted project overrides", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+      const name = "trust-override-test-agent";
+      writeAgentFile(
+        globalAgentsDir,
+        name,
+        [
+          `name: ${name}`,
+          "model: anthropic/global-safe",
+          "cwd: global-safe",
+          "cli: pi",
+          "system-prompt: append",
+        ].join("\n"),
+        "Global safe system prompt.",
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        name,
+        [
+          `name: ${name}`,
+          "model: anthropic/project-override",
+          "cwd: project-override",
+          "cli: claude",
+          "system-prompt: replace",
+        ].join("\n"),
+        "Project override system prompt.",
+      );
+
+      const globalDefaults: Required<TestAgentDefaults> = {
+        model: "anthropic/global-safe",
+        cwd: "global-safe",
+        cli: "pi",
+        systemPromptMode: "append",
+        body: "Global safe system prompt.",
+      };
+      const projectDefaults: Required<TestAgentDefaults> = {
+        model: "anthropic/project-override",
+        cwd: "project-override",
+        cli: "claude",
+        systemPromptMode: "replace",
+        body: "Project override system prompt.",
+      };
+      const unavailableContext = createAgentTrustContext(projectDir, false);
+
+      assertTestAgentDefaults(testApi.loadAgentDefaults(name, unavailableContext, true), globalDefaults);
+      assertTestAgentDefaults(testApi.loadAgentDefaults(name, undefined, true), globalDefaults);
+      for (const context of [unavailableContext, undefined]) {
+        const listing = testApi.discoverAgentDefinitions(context, true)
+          .find((agent: ListedTestAgent) => agent.name === name);
+        assert.equal(listing?.source, "global");
+      }
+
+      const trustedContext = createAgentTrustContext(projectDir, true);
+      assertTestAgentDefaults(testApi.loadAgentDefaults(name, trustedContext, true), projectDefaults);
+      const trustedListing = testApi.discoverAgentDefinitions(trustedContext, true)
+        .find((agent: ListedTestAgent) => agent.name === name);
+      assert.equal(trustedListing?.source, "project");
+    });
+  });
+
+  it("fails closed when the trust reporter throws", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "throwing-trust-test-agent",
+        "name: throwing-trust-test-agent\nmodel: anthropic/project-only",
+      );
+      const throwingContext = {
+        cwd: projectDir,
+        isProjectTrusted() {
+          throw new Error("trust unavailable");
+        },
+      };
+
+      assert.equal(testApi.reportsProjectTrusted(throwingContext), false);
+      assert.equal(testApi.loadAgentDefaults("throwing-trust-test-agent", throwingContext, true), null);
+      const names = testApi.discoverAgentDefinitions(throwingContext, true)
+        .map((agent: ListedTestAgent) => agent.name);
+      assert.equal(names.includes("throwing-trust-test-agent"), false);
+    });
+  });
+
+  it("rejects project-agent path traversal without or with trust", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "traversal-test-agent",
+        "name: traversal-test-agent\nmodel: anthropic/project-only",
+      );
+      const traversalName = "../../project/.pi/agents/traversal-test-agent";
+
+      assert.equal(testApi.loadAgentDefaults(traversalName, undefined, true), null);
+      assert.equal(
+        testApi.loadAgentDefaults(traversalName, createAgentTrustContext(projectDir, false), true),
+        null,
+      );
+      assert.equal(
+        testApi.loadAgentDefaults(traversalName, createAgentTrustContext(projectDir, true), true),
+        null,
+      );
+    });
+  });
+
+  it("refuses unavailable explicit Claude definitions", async () => {
+    await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+      writeAgentFile(
+        globalAgentsDir,
+        "explicit-claude-test-agent",
+        "name: explicit-claude-test-agent\ncli: claude\nmodel: sonnet",
+      );
+      assert.equal(testApi.loadAgentDefaults("explicit-claude-test-agent", undefined, false), null);
+      const names = testApi.discoverAgentDefinitions(undefined, false)
+        .map((agent: ListedTestAgent) => agent.name);
+      assert.equal(names.includes("explicit-claude-test-agent"), false);
+    });
+
+    assert.throws(
+      () => testApi.resolveAgentCli({ cli: "claude" }, false),
+      /claude.*unavailable.*expected.*PATH/i,
+    );
+    assert.equal(testApi.resolveAgentCli(null, false), "pi");
+  });
+
   it("lets a hidden project agent shadow a visible global agent", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
       writeAgentFile(
         globalAgentsDir,
         "shadowed-discovery-test-agent",
@@ -1197,18 +1432,27 @@ describe("subagent discovery", () => {
       );
 
       const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+      subagentsExtension(api, { muxBackend: "tmux", claudeAvailable: true });
 
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
+      const result = await tool.execute(
+        "test-list",
+        {},
+        undefined,
+        undefined,
+        createAgentTrustContext(projectDir, true),
+      );
       const agents = result.details?.agents ?? [];
 
-      assert.equal(agents.some((agent: any) => agent.name === "shadowed-discovery-test-agent"), false);
+      assert.equal(agents.some((agent: ListedTestAgent) => agent.name === "shadowed-discovery-test-agent"), false);
       assert.doesNotMatch(result.content[0].text, /shadowed-discovery-test-agent/);
 
-      const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
+      const loaded = testApi.loadAgentDefaults(
+        "shadowed-discovery-test-agent",
+        createAgentTrustContext(projectDir, true),
+      );
       assert.ok(loaded, "expected project override to remain directly loadable");
       assert.equal(loaded.model, "anthropic/test-project");
       assert.equal(loaded.body, "You are the project hidden agent.");
@@ -1346,7 +1590,7 @@ describe("commands", () => {
   it("/iterate always emits a full-context fork tool call", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
 
-    (subagentsModule as any).default(api);
+    subagentsExtension(api, { muxBackend: "tmux", claudeAvailable: true });
 
     const iterate = registeredCommands.find((command) => command.name === "iterate");
     assert.ok(iterate, "expected /iterate to be registered");
@@ -1360,8 +1604,78 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("replaces the completion signal after shutdown and session rebind", () => {
+    const { api, registeredEventHandlers } = createMockExtensionApi();
+    subagentsExtension(api, { muxBackend: null, claudeAvailable: true });
+    const sessionStart = registeredEventHandlers.get("session_start")?.[0];
+    const sessionShutdown = registeredEventHandlers.get("session_shutdown")?.[0];
+    assert.ok(sessionStart, "expected a session_start lifecycle handler");
+    assert.ok(sessionShutdown, "expected a session_shutdown lifecycle handler");
+
+    sessionStart({ reason: "startup" }, {});
+    const initialSignal = testApi.getModuleAbortSignal();
+    sessionShutdown({ reason: "resume" }, {});
+    assert.equal(initialSignal.aborted, true);
+
+    sessionStart({ reason: "resume" }, {});
+    const reboundSignal = testApi.getModuleAbortSignal();
+    assert.equal(reboundSignal.aborted, false);
+    assert.notEqual(reboundSignal, initialSignal);
+  });
+
+  it("lazily repairs an aborted completion signal", () => {
+    const staleController = testApi.replaceModuleAbortController();
+    staleController.abort();
+
+    const repairedSignal = testApi.getModuleAbortSignal();
+
+    assert.equal(staleController.signal.aborted, true);
+    assert.equal(repairedSignal.aborted, false);
+    assert.notEqual(repairedSignal, staleController.signal);
+  });
+
+  it("registers parent tools only for an active supported multiplexer", () => {
+    assert.equal(testApi.shouldRegisterParentSubagentTools(null), false);
+    assert.equal(testApi.shouldRegisterParentSubagentTools("tmux"), true);
+
+    const { api, registeredTools, registeredCommands } = createMockExtensionApi();
+    subagentsExtension(api, { muxBackend: null, claudeAvailable: true });
+
+    const parentToolNames = new Set([
+      "subagent",
+      "subagent_interrupt",
+      "subagents_list",
+      "subagent_resume",
+    ]);
+    assert.equal(registeredTools.some((tool) => parentToolNames.has(tool.name)), false);
+    assert.ok(registeredCommands.some((command) => command.name === "iterate"));
+    assert.ok(registeredCommands.some((command) => command.name === "subagent"));
+  });
+
+  it("commands report a setup hint when no multiplexer is active", async () => {
+    const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+    subagentsExtension(api, { muxBackend: null, claudeAvailable: true });
+    const notices: string[] = [];
+    const context = {
+      ui: {
+        notify(message: string) {
+          notices.push(message);
+        },
+      },
+    };
+
+    const iterate = registeredCommands.find((command) => command.name === "iterate");
+    const subagent = registeredCommands.find((command) => command.name === "subagent");
+    await iterate.handler("Fix the bug", context);
+    await subagent.handler("worker Fix the bug", context);
+
+    assert.equal(sentUserMessages.length, 0);
+    assert.equal(notices.length, 2);
+    assert.match(notices[0], /supported terminal multiplexer.*Start pi inside/i);
+    assert.match(notices[1], /supported terminal multiplexer.*Start pi inside/i);
+  });
+
   it("defaults resumed subagents to auto-exit and non-interactive tracking", () => {
-    const testApi = (subagentsModule as any).__test__;
 
     assert.deepEqual(testApi.resolveResumeLaunchBehavior({}), {
       autoExit: true,
@@ -1374,7 +1688,6 @@ describe("tool registration", () => {
   });
 
   it("expands spawning false to deny subagent interruption", () => {
-    const testApi = (subagentsModule as any).__test__;
     const denied = testApi.resolveDenyTools({ spawning: false });
 
     assert.equal(denied.has("subagent"), true);
@@ -1384,7 +1697,7 @@ describe("tool registration", () => {
 
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsExtension(api, { muxBackend: "tmux", claudeAvailable: true });
 
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
@@ -1405,7 +1718,7 @@ describe("tool registration", () => {
 
   it("registers subagent_resume with an autoExit override", () => {
     const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsExtension(api, { muxBackend: "tmux", claudeAvailable: true });
 
     const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
     assert.ok(resumeTool, "expected subagent_resume tool to be registered");
@@ -1606,14 +1919,13 @@ describe("subagent interruption", () => {
   it("registers subagent_interrupt in the main session extension", () => {
     const { api, registeredTools } = createMockExtensionApi();
 
-    (subagentsModule as any).default(api);
+    subagentsExtension(api, { muxBackend: "tmux", claudeAvailable: true });
 
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
   });
 
   it("resolves interrupt targets by exact id and reports name ambiguity", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const runningMap = testApi.runningSubagents;
     runningMap.clear();
 
     try {
@@ -1632,7 +1944,6 @@ describe("subagent interruption", () => {
   });
 
   it("returns an explicit error when Escape delivery fails", () => {
-    const testApi = (subagentsModule as any).__test__;
     let aborted = false;
     const running = makeRunning({
       abortController: {
@@ -1652,8 +1963,7 @@ describe("subagent interruption", () => {
   });
 
   it("leaves status unchanged when Escape delivery fails in the tool path", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const runningMap = testApi.runningSubagents;
     runningMap.clear();
 
     const activeState = observeStatus(
@@ -1686,7 +1996,6 @@ describe("subagent interruption", () => {
   });
 
   it("sends Escape without aborting or mutating running state", () => {
-    const testApi = (subagentsModule as any).__test__;
     let aborted = false;
     let sentSurface = "";
     const running = makeRunning({
@@ -1708,8 +2017,7 @@ describe("subagent interruption", () => {
   });
 
   it("refreshes the latest activity snapshot before forcing local interrupt waiting", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const runningMap = testApi.runningSubagents;
     let sentSurface = "";
     runningMap.clear();
 
@@ -1759,8 +2067,7 @@ describe("subagent interruption", () => {
   });
 
   it("acknowledges Pi-backed interrupt requests and forces local status waiting", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const runningMap = testApi.runningSubagents;
     let sentSurface = "";
     runningMap.clear();
 
@@ -1799,8 +2106,7 @@ describe("subagent interruption", () => {
   });
 
   it("sends Escape again for repeated interrupt requests", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const runningMap = testApi.runningSubagents;
     const surfaces: string[] = [];
     runningMap.clear();
 
@@ -1822,8 +2128,7 @@ describe("subagent interruption", () => {
   });
 
   it("rejects Claude-backed interrupt requests before delivery", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const runningMap = testApi.runningSubagents;
     let delivered = false;
     runningMap.clear();
 
@@ -1847,7 +2152,6 @@ describe("subagent interruption", () => {
   });
 
   it("formats exit code 130 as an ordinary failure", () => {
-    const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveResultPresentation(
       {
         exitCode: 130,
@@ -1869,7 +2173,6 @@ describe("subagent interruption", () => {
     // quickly. With the error sidecar plumbed through, the presentation
     // must call out the failure, include the underlying error, and tell the
     // orchestrator how to recover.
-    const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveResultPresentation(
       {
         exitCode: 1,
@@ -1907,7 +2210,7 @@ describe("subagent status renderer", () => {
 
   it("renders only capped lines plus overflow", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsExtension(api, { muxBackend: "tmux", claudeAvailable: true });
 
     const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_status");
     assert.ok(rendererEntry, "expected subagent_status renderer to be registered");
@@ -1941,7 +2244,7 @@ describe("subagent status renderer", () => {
 
   it("stays within narrow widths", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
+    subagentsExtension(api, { muxBackend: "tmux", claudeAvailable: true });
 
     const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_status");
     assert.ok(rendererEntry, "expected subagent_status renderer to be registered");
@@ -1969,7 +2272,6 @@ describe("subagent status renderer", () => {
 
 describe("subagent startup delay", () => {
   it("defaults to 500ms when no env var is set", () => {
-    const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
 
@@ -1984,7 +2286,6 @@ describe("subagent startup delay", () => {
   });
 
   it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
 
@@ -2000,7 +2301,6 @@ describe("subagent startup delay", () => {
 });
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
-    const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
 
@@ -2047,7 +2347,6 @@ describe("subagents widget rendering", () => {
   });
 
   it("truncates the right-hand status instead of overflowing when it alone is too wide", () => {
-    const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.borderLine, "function");
 
@@ -2056,7 +2355,6 @@ describe("subagents widget rendering", () => {
   });
 
   it("handles ultra-narrow widths without exceeding the width contract", () => {
-    const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
 

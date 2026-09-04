@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { createTmuxSubagentSurface } from "./tmux.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -77,6 +78,14 @@ export function isZellijAvailable(): boolean {
 
 export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
+}
+
+/** Report whether the optional Claude Code CLI is available.
+ *
+ * @example isClaudeAvailable() // true when `claude` is on PATH
+ */
+export function isClaudeAvailable(): boolean {
+  return hasCommand("claude");
 }
 
 export function getMuxBackend(): MuxBackend | null {
@@ -747,7 +756,8 @@ function createCmuxSplitSurface(
  * For cmux: the first call creates a right-split pane; subsequent calls add
  * tabs to that same pane (avoiding ever-narrower splits).
  * For zellij: chooses a tab-aware tiled or stacked placement.
- * For tmux/wezterm: falls back to split behavior.
+ * For tmux: keeps at most five panes per window and adds windows as needed.
+ * For wezterm: falls back to split behavior.
  *
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
@@ -776,10 +786,15 @@ export function createSurface(name: string): string {
     return createZellijSurface(name);
   }
 
-  // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
-  // See https://github.com/HazAT/pi-interactive-subagents/issues/12
-  const fromSurface = backend === "tmux" ? process.env.TMUX_PANE : undefined;
-  return createSurfaceSplit(name, "right", fromSurface);
+  if (backend === "tmux") {
+    const parentPane = process.env.TMUX_PANE;
+    if (!parentPane) {
+      throw new Error("Missing TMUX_PANE; expected the parent Pi pane id for subagent placement.");
+    }
+    return createTmuxSubagentSurface(name, parentPane, process.cwd());
+  }
+
+  return createSurfaceSplit(name, "right");
 }
 
 /**
