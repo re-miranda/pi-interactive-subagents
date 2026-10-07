@@ -189,7 +189,9 @@ cli: claude
 ---
 ```
 
-Claude Code must be available on `PATH`. Claude children start with `--permission-mode manual`; permission prompts remain interactive in their managed multiplexer pane. The launcher binds every option value to its flag and terminates option parsing before the task, so option-shaped inputs cannot add Claude CLI flags. The extension never bypasses permission checks. Runtime choice comes from `cli`, not from a model name such as `anthropic/claude-*`.
+Claude Code must be available on `PATH` and support Auto mode. Every new Claude child process, including a resumed conversation, starts with `--permission-mode auto` (capability: `auto-permissions-v1`), never `bypassPermissions` or permission-bypass flags. The managed multiplexer pane remains accessible for manual interaction and any permission prompts; native lifecycle handling is unchanged. The launcher binds every option value to its flag and terminates option parsing before the task, so option-shaped inputs cannot add Claude CLI flags. Runtime choice comes from `cli`, not from a model name such as `anthropic/claude-*`.
+
+After installing an updated extension, reload the parent Pi session before launching children. Running Claude sessions are not changed. If Claude does not support Auto mode, update Claude rather than substituting a bypass mode.
 
 ---
 
@@ -313,7 +315,7 @@ Claude Code children do not inherit Pi model identifiers; they use only an expli
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
-| `cli`         | string  | Child process runtime: `pi` (default) or `claude`. Claude Code children require the `claude` executable and use interactive manual permissions.                                                                                                                             |
+| `cli`         | string  | Child process runtime: `pi` (default) or `claude`. Claude Code children require the `claude` executable with Auto mode support and start with `--permission-mode auto`.                                                                                                                             |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |

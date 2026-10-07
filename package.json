@@ -26,7 +26,7 @@
       "./pi-extension/subagents/index.ts"
     ],
     "capabilities": {
-      "claudeCodeLaunchPolicy": "manual-permissions-v1"
+      "claudeCodeLaunchPolicy": "auto-permissions-v1"
     }
   },
   "devDependencies": {
