@@ -10,6 +10,7 @@ export type SubagentActivityEvent =
   | "before_agent_start"
   | "agent_start"
   | "agent_end"
+  | "agent_settled"
   | "turn_start"
   | "turn_end"
   | "before_provider_request"
@@ -59,7 +60,7 @@ export interface SubagentActivityRecorder {
   beforeAgentStart(): void;
   agentStart(): void;
   agentEndWaiting(): void;
-  agentEndDone(): void;
+  agentSettledDone(): void;
   turnStart(turnIndex?: number): void;
   turnEnd(turnIndex?: number): void;
   beforeProviderRequest(): void;
@@ -85,6 +86,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "before_agent_start",
   "agent_start",
   "agent_end",
+  "agent_settled",
   "turn_start",
   "turn_end",
   "before_provider_request",
@@ -228,7 +230,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     beforeAgentStart() {},
     agentStart() {},
     agentEndWaiting() {},
-    agentEndDone() {},
+    agentSettledDone() {},
     turnStart() {},
     turnEnd() {},
     beforeProviderRequest() {},
@@ -295,12 +297,15 @@ export function createSubagentActivityRecorder(params: {
   runningChildId?: string;
   activityFile?: string;
   now?: () => number;
+  writeActivityFile?: typeof writeSubagentActivityFile;
 }): SubagentActivityRecorder {
   const runningChildId = params.runningChildId?.trim();
-  const activityFile = params.activityFile?.trim();
-  if (!runningChildId || !activityFile) return createNoopRecorder();
+  const requestedActivityFile = params.activityFile?.trim();
+  if (!runningChildId || !requestedActivityFile) return createNoopRecorder();
+  const activityFile: string = requestedActivityFile;
 
   const now = params.now ?? (() => Date.now());
+  const writeActivityFile = params.writeActivityFile ?? writeSubagentActivityFile;
   const createdAt = now();
   const activity: SubagentActivityState = {
     version: 1,
@@ -335,7 +340,7 @@ export function createSubagentActivityRecorder(params: {
   function flushNow(): void {
     if (disabled) return;
     try {
-      writeSubagentActivityFile(activityFile, activity);
+      writeActivityFile(activityFile, activity);
       lastFlushAt = now();
       failureCount = 0;
     } catch {
@@ -416,8 +421,8 @@ export function createSubagentActivityRecorder(params: {
         current.waitingSince = observedAt;
       }, "immediate");
     },
-    agentEndDone() {
-      markDone("agent_end");
+    agentSettledDone() {
+      markDone("agent_settled");
     },
     turnStart(turnIndex) {
       record("turn_start", (current, observedAt) => {

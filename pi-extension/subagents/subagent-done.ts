@@ -1,6 +1,6 @@
 /**
  * Extension loaded into sub-agents.
- * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
+ * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+Alt+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -9,32 +9,26 @@ import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
+/** Ignore the injected initial task; e.g. shouldMarkUserTookOver(false) is false. */
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
+interface SubagentOutcomeMessage {
+  role: string;
+  stopReason?: string;
+  errorMessage?: unknown;
+}
+
+/** Classify a run, not its settlement; e.g. an aborted assistant keeps the child open. */
 export function shouldAutoExitOnAgentEnd(
   _userTookOver: boolean,
-  messages: any[] | undefined,
+  messages: readonly SubagentOutcomeMessage[] | undefined,
 ): boolean {
-  // Manual input should not strand an auto-exit subagent. If the latest agent
-  // turn completed normally, close the session. Escape/abort still leaves it
-  // open for inspection or another prompt.
-  //
-  // stopReason: "error" (e.g. exhausted retries on a provider overload) also
-  // returns true — we want to shut down so the parent is woken up — but we
-  // pair this with findLatestAssistantError() so the parent learns it was an
-  // error, not a clean completion.
-  if (messages) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
-      }
-    }
-  }
-
-  return true;
+  // Manual input must not strand autonomous work; Escape/abort still leaves
+  // it open. Errors exit only after settlement proves retries are exhausted.
+  const latestAssistant = messages?.findLast((message) => message.role === "assistant");
+  return latestAssistant?.stopReason !== "aborted";
 }
 
 export interface SubagentErrorInfo {
@@ -50,22 +44,20 @@ export interface SubagentErrorInfo {
  *
  * Returns `null` when the latest assistant turn completed normally or was
  * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
+ * Example: an error followed by a successful assistant returns null.
  */
 export function findLatestAssistantError(
-  messages: any[] | undefined,
+  messages: readonly SubagentOutcomeMessage[] | undefined,
 ): SubagentErrorInfo | null {
-  if (!messages) return null;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg?.role !== "assistant") continue;
-    if (msg.stopReason !== "error") return null;
-    const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
-    return {
-      errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
-      stopReason: "error",
-    };
-  }
-  return null;
+  const latestAssistant = messages?.findLast((message) => message.role === "assistant");
+  if (latestAssistant?.stopReason !== "error") return null;
+  const raw = typeof latestAssistant.errorMessage === "string"
+    ? latestAssistant.errorMessage.trim()
+    : "";
+  return {
+    errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
+    stopReason: "error",
+  };
 }
 
 export function parseDeniedTools(rawValue: string | undefined): string[] {
@@ -75,7 +67,34 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export default function (pi: ExtensionAPI) {
+export type SubagentExitPayload =
+  | { type: "done" }
+  | { type: "ping"; name: string; message: string }
+  | ({ type: "error" } & SubagentErrorInfo);
+
+export interface SubagentCompletionDependencies {
+  createActivityRecorder: typeof createSubagentActivityRecorder;
+  writeExitSidecar: (sessionFile: string, payload: SubagentExitPayload) => void;
+}
+
+/** Publish a watcher record; e.g. writeSubagentExitSidecar("child.jsonl", { type: "done" }). */
+export function writeSubagentExitSidecar(
+  sessionFile: string,
+  payload: SubagentExitPayload,
+  writeSidecarFile: (path: string, contents: string) => void = writeFileSync,
+): void {
+  // The watcher reads this independently of terminal process exit.
+  writeSidecarFile(`${sessionFile}.exit`, JSON.stringify(payload));
+}
+
+/** Register child lifecycle hooks; e.g. automatic completion waits for agent_settled. */
+export default function (
+  pi: ExtensionAPI,
+  dependencies: SubagentCompletionDependencies = {
+    createActivityRecorder: createSubagentActivityRecorder,
+    writeExitSidecar: writeSubagentExitSidecar,
+  },
+): void {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
@@ -85,7 +104,7 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
-  const recorder = createSubagentActivityRecorder({
+  const recorder = dependencies.createActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
@@ -102,7 +121,7 @@ export default function (pi: ExtensionAPI) {
         if (expanded) {
           // Expanded: full tool list + denied
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
-          const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
+          const hint = theme.fg("muted", "  (Ctrl+Alt+J to collapse)");
 
           const toolList = toolNames
             .map((name: string) => theme.fg("dim", name))
@@ -129,7 +148,7 @@ export default function (pi: ExtensionAPI) {
             denied.length > 0
               ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
               : "";
-          const hint = theme.fg("muted", "  (Ctrl+J to expand)");
+          const hint = theme.fg("muted", "  (Ctrl+Alt+J to expand)");
 
           const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
           box.addChild(content);
@@ -143,6 +162,8 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let completionRequested = false;
+  let latestOutcome: { shouldExit: boolean; errorInfo: SubagentErrorInfo | null } | undefined;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -171,45 +192,29 @@ export default function (pi: ExtensionAPI) {
     recorder.agentStart();
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
-
-    if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
-      }
-
-      recorder.agentEndDone();
-      ctx.shutdown();
-      return;
-    }
-
+  pi.on("agent_end", (event) => {
+    // Pi 1.0.4 (7c10bd433) can retry or continue after agent_end; only the latest run counts.
+    latestOutcome = {
+      shouldExit: autoExit && shouldAutoExitOnAgentEnd(userTookOver, event.messages),
+      errorInfo: findLatestAssistantError(event.messages),
+    };
     recorder.agentEndWaiting();
-    if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest agent turn completed normally, not by who initiated it.
-      userTookOver = false;
+    if (autoExit) userTookOver = false;
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    if (completionRequested || !latestOutcome?.shouldExit) return;
+    completionRequested = true;
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (latestOutcome.errorInfo && sessionFile) {
+      try {
+        dependencies.writeExitSidecar(sessionFile, { type: "error", ...latestOutcome.errorInfo });
+      } catch {
+        // Best effort: the watcher can recover errors from the session file.
+      }
     }
+    recorder.agentSettledDone();
+    ctx.shutdown();
   });
 
   pi.on("turn_start", (event) => {
@@ -256,8 +261,8 @@ export default function (pi: ExtensionAPI) {
     recorder.sessionShutdown((event as any).reason);
   });
 
-  // Toggle expand/collapse with Ctrl+J
-  pi.registerShortcut("ctrl+j", {
+  // Ctrl+J belongs to Pi's default newline action.
+  pi.registerShortcut("ctrl+alt+j", {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
       expanded = !expanded;
@@ -290,8 +295,9 @@ export default function (pi: ExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      dependencies.writeExitSidecar(sessionFile, exitData);
 
+      completionRequested = true;
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
@@ -312,8 +318,9 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        dependencies.writeExitSidecar(sessionFile, { type: "done" });
       }
+      completionRequested = true;
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],

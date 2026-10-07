@@ -1772,7 +1772,7 @@ describe("subagent activity snapshots", () => {
     });
   });
 
-  it("records waiting and final done states", () => {
+  it("records waiting and settled done states", () => {
     withTempDir((dir) => {
       let currentNow = 2_000;
       const activityFile = getSubagentActivityFile(dir, "child-2");
@@ -1791,10 +1791,11 @@ describe("subagent activity snapshots", () => {
       assert.equal(read.activity.waitingSince, 3_000);
 
       currentNow = 4_000;
-      recorder.subagentDone();
+      recorder.agentSettledDone();
       read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "done");
+      assert.equal(read.activity.latestEvent, "agent_settled");
       assert.equal(read.activity.agentActive, false);
     });
   });
