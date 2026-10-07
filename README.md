@@ -512,6 +512,10 @@ export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
 
 ---
 
+## Local Development
+
+The repository's `.pi/settings.json` loads the local extension and suppresses installed upstream/fork copies with `autoload: false` filtering deltas and `!**` exclusions. This prevents duplicate tool registrations when Pi starts inside the checkout; an empty delta list would leave the installed resources enabled.
+
 ## Acknowledgements
 
 The sub-agent status supervision and turn-only interruption features were inspired by [RepoPrompt](https://repoprompt.com/)'s sub-agent snapshot polling and run cancellation features.

@@ -2,8 +2,15 @@
   "packages": [
     {
       "source": "git:github.com/HazAT/pi-interactive-subagents",
-      "extensions": [],
-      "skills": []
+      "autoload": false,
+      "extensions": ["!**"],
+      "skills": ["!**"]
+    },
+    {
+      "source": "git:github.com/re-miranda/pi-interactive-subagents",
+      "autoload": false,
+      "extensions": ["!**"],
+      "skills": ["!**"]
     }
   ],
   "extensions": [
